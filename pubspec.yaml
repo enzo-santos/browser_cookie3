@@ -1,0 +1,17 @@
+name: browser_cookie3
+description: A port of https://github.com/borisbabic/browser_cookie3 to Dart.
+version: 0.1.0
+repository: https://github.com/enzo-santos/browser_cookie3
+
+environment:
+  sdk: ^3.0.6
+
+dependencies:
+  ffi: ^2.1.0
+  glob: ^2.1.2
+  path: ^1.8.3
+  sqlite3: ^2.1.0
+  cryptography: ^2.5.0
+
+dev_dependencies:
+  lints: ^2.0.0
