@@ -6,6 +6,7 @@ import 'dart:ffi' as ffi;
 import 'dart:io';
 
 import 'package:cryptography/cryptography.dart';
+import 'package:ffi/ffi.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
 
@@ -32,24 +33,20 @@ class _DatabaseConnection {
     bool tryLegacyFirst = false,
   }) : _databaseFile = databaseFile {
     _methods = [_sqlite3ConnectReadonly];
+    final _ConnectionMethod legacyMethod = _getConnectionLegacy;
     if (tryLegacyFirst) {
-      _methods.insert(0, _getConnectionLegacy);
+      _methods.insert(0, legacyMethod);
     } else {
-      _methods.add(_getConnectionLegacy);
+      _methods.add(legacyMethod);
     }
   }
 
   Future<Database?> _sqlite3ConnectReadonly() async {
-    const List<String> options = [
-      '?mode=ro',
-      '?mode=ro&nolock=1',
-      '?mode=ro&immutable=1',
-    ];
     final Uri uri = _databaseFile.absolute.uri;
-    for (String option in options) {
+    for (String option in ['a']) {
       final Database database;
       try {
-        database = sqlite3.open('$uri$option', uri: true);
+        database = sqlite3.open('$uri', mode: OpenMode.readOnly);
       } catch (e) {
         continue;
       }
@@ -66,7 +63,9 @@ class _DatabaseConnection {
     await _databaseFile.copy(tempFile.path);
     _tempCookieFile = tempFile.path;
 
+    print('_getConnectionLegacy:opening');
     final Database database = sqlite3.open(tempFile.path);
+    print('_getConnectionLegacy:opened');
     if (_checkConnectionOk(database)) return database;
     return null;
   }
@@ -77,7 +76,13 @@ class _DatabaseConnection {
       return currentDatabase;
     }
     for (_ConnectionMethod method in _methods) {
-      final Database? database = await method();
+      final Database? database;
+      try {
+        database = await method();
+      } catch (e) {
+        print(e);
+        continue;
+      }
       if (database == null) continue;
       _database = database;
       return database;
@@ -116,7 +121,7 @@ final class DataBlob extends ffi.Struct {
   @ffi.Long()
   external int cbData;
 
-  external ffi.Pointer<ffi.Char> pbData;
+  external ffi.Pointer<ffi.Uint8> pbData;
 }
 
 class ChromiumBased {
@@ -140,7 +145,7 @@ class ChromiumBased {
     List<Location> cookiesLocations = const [],
     List<Location> keysLocations = const [],
   })  : _salt = [115, 97, 108, 116, 121, 115, 97, 108, 116] /* b"saltysalt" */,
-        _iv = List.filled(16, 32 /* ASCII space */),
+        _iv = List.filled(16, 32 /* b"" */),
         _length = 16 {
     _cookieFileFuture = _addKeyAndCookieFile(
       cookieFile: cookieFile,
@@ -161,14 +166,14 @@ class ChromiumBased {
       final Map keyFileJson = jsonDecode(await keyFile.readAsString());
       final String key64 = keyFileJson['os_crypt']['encrypted_key'];
 
-      // Decode Key, get rid of DPAPI prefix, unprotect data
+// Decode Key, get rid of DPAPI prefix, unprotect data
       final List<int> keyDpApi = base64Decode(key64).sublist(5);
-      _v10Key = _cryptUnprotectedData(cypherText: keyDpApi, isKey: true).$2;
+      _v10Key = _cryptUnprotectData(cipherText: keyDpApi);
     } else {
       _v10Key = null;
     }
 
-    // TODO Implement to Chrome
+// TODO Implement to Chrome
     return cookieFile ?? _expandPaths(cookiesLocations);
   }
 
@@ -181,17 +186,18 @@ class ChromiumBased {
       throw StateError('Failed to find $browser cookie');
     }
     final List<Cookie> cookies = [];
+
     await _DatabaseConnection(databaseFile: cookieFile).use((cursor) async {
       late final ResultSet items;
       try {
-        // Chrome < 56
+// Chrome < 56
         items = cursor.select(
           'SELECT host_key, path, secure, expires_utc, name, value, encrypted_value, is_httponly '
           'FROM cookies WHERE host_key like ?;',
           ['%$domainName%'],
         );
       } catch (e) {
-        // Chrome >= 56
+// Chrome >= 56
         items = cursor.select(
           'SELECT host_key, path, is_secure, expires_utc, name, value, encrypted_value, is_httponly '
           'FROM cookies WHERE host_key like ?;',
@@ -231,7 +237,7 @@ class ChromiumBased {
 
   static List<Location> _generateWinPathsChromium(List<String> paths) {
     return paths.expand((path) {
-      // TODO 'Profile *' e 'Edge*'
+// TODO 'Profile *' e 'Edge*'
       return [
         Location(env: 'APPDATA', path: '..\\Local\\$path'),
         Location(env: 'LOCALAPPDATA', path: path),
@@ -268,7 +274,7 @@ class ChromiumBased {
       ..secure = secure
       ..expires =
           expires == null ? null : DateTime.fromMillisecondsSinceEpoch(expires)
-      // TODO Check if use fromMillisecondsSinceEpoch or fromMicrosecondsSinceEpoch
+// TODO Check if use fromMillisecondsSinceEpoch or fromMicrosecondsSinceEpoch
       ..httpOnly = httpOnly;
   }
 
@@ -278,7 +284,7 @@ class ChromiumBased {
   ) {
     if (value.isEmpty) return value;
     if (encryptedValue.isEmpty) return '';
-    return utf8.decode(_cryptUnprotectedData(cypherText: encryptedValue).$2);
+    return utf8.decode(_cryptUnprotectData(cipherText: encryptedValue));
   }
 
   Future<String> _decrypt(String value, List<int> encryptedValue) async {
@@ -295,7 +301,7 @@ class ChromiumBased {
       final List<int> nonce = encryptedValue.take(12).toList();
       final List<int> tag = encryptedValue.sublist(encryptedValue.length - 16);
 
-      // TODO Check if correct
+// TODO Check if correct
       final AesGcm algorithm = AesGcm.with128bits();
       final List<int> data;
       try {
@@ -312,31 +318,6 @@ class ChromiumBased {
       }
       return utf8.decode(data);
     }
-  }
-
-  static (String, List<int>) _cryptUnprotectedData({
-    List<int> cypherText = const [],
-    List<int> entropy = const [],
-    Object? reserved,
-    Object? promptStruct,
-    bool isKey = false,
-  }) {
-    // TODO: Implement
-    throw UnimplementedError();
-    // final ffi.Pointer<DataBlob> blobIn = calloc<DataBlob>();
-    // blobIn.ref.cbData = cypherText.length;
-    //
-    // final ffi.Pointer<DataBlob> blobEntropy = calloc<DataBlob>();
-    // blobIn.ref.cbData = entropy.length;
-    //
-    // final ffi.Pointer<DataBlob> blobOut = calloc<DataBlob>();
-    // blobIn.ref.cbData = 0;
-    //
-    // const int cryptProtectUiForbidden = 0x01;
-    //
-    // calloc.free(blobIn);
-    // calloc.free(blobEntropy);
-    // calloc.free(blobOut);
   }
 }
 
@@ -382,4 +363,90 @@ void main() async {
     ),
   );
   print(await edge.loadCookies());
+}
+
+List<int> _cryptUnprotectData({
+  List<int> cipherText = const [],
+  List<int> entropy = const [],
+}) {
+// We assume that we're running under Windows in this context.
+  final crypt32 = ffi.DynamicLibrary.open('crypt32.dll');
+
+  final blobIn = calloc<DataBlob>()
+    ..ref.cbData = cipherText.length
+    ..ref.pbData = calloc.allocate<ffi.Uint8>(cipherText.length);
+  blobIn.ref.pbData.asTypedList(cipherText.length).setAll(0, cipherText);
+
+  final blobEntropy = calloc<DataBlob>()
+    ..ref.cbData = entropy.length
+    ..ref.pbData = calloc.allocate<ffi.Uint8>(entropy.length);
+  blobEntropy.ref.pbData.asTypedList(entropy.length).setAll(0, entropy);
+
+  final blobOut = calloc<DataBlob>()
+    ..ref.cbData = 0
+    ..ref.pbData = ffi.nullptr;
+
+  ffi.Pointer<ffi.Int32> desc = ffi.nullptr;
+
+  const int cryptprotectUiForbidden = 0x01;
+  final bool result = crypt32.lookupFunction<
+      ffi.Bool Function(
+        ffi.Pointer<DataBlob>,
+        ffi.Pointer<ffi.Int32>,
+        ffi.Pointer<DataBlob>,
+        ffi.Pointer<ffi.Void>,
+        ffi.Pointer<ffi.Void>,
+        ffi.Uint32,
+        ffi.Pointer<DataBlob>,
+      ),
+      bool Function(
+        ffi.Pointer<DataBlob>,
+        ffi.Pointer<ffi.Int32>,
+        ffi.Pointer<DataBlob>,
+        ffi.Pointer<ffi.Void>,
+        ffi.Pointer<ffi.Void>,
+        int,
+        ffi.Pointer<DataBlob>,
+      )>('CryptUnprotectData')(
+    blobIn,
+    desc,
+    blobEntropy,
+    ffi.nullptr,
+    ffi.nullptr,
+    cryptprotectUiForbidden,
+    blobOut,
+  );
+  if (!result) {
+    throw StateError('Failed to decrypt the cipher text with DPAPI');
+  }
+
+  final ffi.Pointer<ffi.Uint8> bufferOut =
+      calloc.allocate<ffi.Uint8>(blobOut.ref.cbData);
+  bufferOut
+      .asTypedList(blobOut.ref.cbData)
+      .setAll(0, blobOut.ref.pbData.asTypedList(blobOut.ref.cbData));
+
+  final kernel32 = ffi.DynamicLibrary.open('kernel32.dll');
+  kernel32.lookupFunction<
+      ffi.Pointer<ffi.Void> Function(
+        ffi.Pointer,
+      ),
+      ffi.Pointer<ffi.Void> Function(
+        ffi.Pointer,
+      )>('LocalFree')(desc);
+
+  kernel32.lookupFunction<
+      ffi.Pointer<ffi.Void> Function(
+        ffi.Pointer,
+      ),
+      ffi.Pointer<ffi.Void> Function(
+        ffi.Pointer,
+      )>('LocalFree')(blobOut.ref.pbData);
+
+  final List<int> keyList = List.generate(
+    blobOut.ref.cbData,
+    (index) => bufferOut.elementAt(index).value,
+  );
+  calloc.free(bufferOut);
+  return keyList;
 }
